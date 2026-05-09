@@ -43,6 +43,7 @@ export async function GET() {
   let totalHubSpotContactsChecked = 0;
   let totalHubSpotContactsWithSemblePatientId = 0;
   let totalHubSpotContactsWithoutSemblePatientId = 0;
+  let totalDuplicateConflicts = 0;
   const failedPatients: Array<{
     patientId: string;
     name: string;
@@ -52,31 +53,44 @@ export async function GET() {
     error: string;
   }> = [];
   const missingSembleIdHubSpotSamples: Array<{
-    id: string;
-    firstname: string | null;
-    lastname: string | null;
-    phone: string | null;
-    email: string | null;
-    semble_patient_id: null;
+    patientId: null;
+    hubspotId: string;
+    hadPhone: boolean;
+    hadEmail: boolean;
+    hadSemblePatientId: false;
+    matchedByNamePhone: false;
+    matchedByNameEmail: false;
+    duplicateConflict: false;
   }> = [];
   const matchedByNamePhoneSamples: Array<{
     patientId: string;
-    name: string;
-    phone: string;
-    matchedHubSpotContactId: string;
+    hubspotId: string;
+    hadPhone: boolean;
+    hadEmail: boolean;
+    hadSemblePatientId: boolean;
+    matchedByNamePhone: true;
+    matchedByNameEmail: false;
+    duplicateConflict: boolean;
   }> = [];
   const unmatchedSembleSamples: Array<{
     patientId: string;
-    name: string;
-    phone: string;
-    email: string | null;
+    hubspotId: null;
+    hadPhone: boolean;
+    hadEmail: boolean;
+    hadSemblePatientId: false;
+    matchedByNamePhone: false;
+    matchedByNameEmail: false;
+    duplicateConflict: false;
   }> = [];
   const duplicateConflictSamples: Array<{
     patientId: string;
-    name: string;
-    operation: "PATCH" | "POST";
-    status: number;
-    message: string;
+    hubspotId: string | null;
+    hadPhone: boolean;
+    hadEmail: boolean;
+    hadSemblePatientId: boolean;
+    matchedByNamePhone: boolean;
+    matchedByNameEmail: boolean;
+    duplicateConflict: true;
   }> = [];
 
   try {
@@ -189,14 +203,16 @@ export async function GET() {
             totalHubSpotContactsWithSemblePatientId += 1;
           } else {
             totalHubSpotContactsWithoutSemblePatientId += 1;
-            if (missingSembleIdHubSpotSamples.length < 10) {
+            if (missingSembleIdHubSpotSamples.length < 5) {
               missingSembleIdHubSpotSamples.push({
-                id: String(contact?.id ?? ""),
-                firstname: contact?.properties?.firstname ?? null,
-                lastname: contact?.properties?.lastname ?? null,
-                phone: contact?.properties?.phone ?? null,
-                email: contact?.properties?.email ?? null,
-                semble_patient_id: null,
+                patientId: null,
+                hubspotId: String(contact?.id ?? ""),
+                hadPhone: Boolean(contact?.properties?.phone),
+                hadEmail: Boolean(contact?.properties?.email),
+                hadSemblePatientId: false,
+                matchedByNamePhone: false,
+                matchedByNameEmail: false,
+                duplicateConflict: false,
               });
             }
           }
@@ -368,13 +384,19 @@ export async function GET() {
             );
             const updateResponse = updateResult.response;
 
-            if (updateResult.hadDuplicateConflict && duplicateConflictSamples.length < 10) {
+            if (updateResult.hadDuplicateConflict) {
+              totalDuplicateConflicts += 1;
+            }
+            if (updateResult.hadDuplicateConflict && duplicateConflictSamples.length < 5) {
               duplicateConflictSamples.push({
                 patientId,
-                name: patientName,
-                operation: "PATCH",
-                status: 409,
-                message: "Retrying update without email due to duplicate/shared email conflict",
+                hubspotId: existingContactId,
+                hadPhone: Boolean(phoneNumber),
+                hadEmail: Boolean(email),
+                hadSemblePatientId: matchMethod === "semble_id",
+                matchedByNamePhone: matchMethod === "name_phone",
+                matchedByNameEmail: matchMethod === "name_email",
+                duplicateConflict: true,
               });
             }
 
@@ -397,12 +419,16 @@ export async function GET() {
             } else if (matchMethod === "name_phone") {
               totalMatchedByNamePhone += 1;
               totalBackfilled += 1;
-              if (matchedByNamePhoneSamples.length < 10) {
+              if (matchedByNamePhoneSamples.length < 5) {
                 matchedByNamePhoneSamples.push({
                   patientId,
-                  name: patientName,
-                  phone: phoneNumber,
-                  matchedHubSpotContactId: existingContactId,
+                  hubspotId: existingContactId,
+                  hadPhone: Boolean(phoneNumber),
+                  hadEmail: Boolean(email),
+                  hadSemblePatientId: false,
+                  matchedByNamePhone: true,
+                  matchedByNameEmail: false,
+                  duplicateConflict: updateResult.hadDuplicateConflict,
                 });
               }
             } else if (matchMethod === "name_email") {
@@ -410,12 +436,16 @@ export async function GET() {
               totalBackfilled += 1;
             }
           } else {
-            if (unmatchedSembleSamples.length < 10) {
+            if (unmatchedSembleSamples.length < 5) {
               unmatchedSembleSamples.push({
                 patientId,
-                name: patientName,
-                phone: phoneNumber,
-                email: email ?? null,
+                hubspotId: null,
+                hadPhone: Boolean(phoneNumber),
+                hadEmail: Boolean(email),
+                hadSemblePatientId: false,
+                matchedByNamePhone: false,
+                matchedByNameEmail: false,
+                duplicateConflict: false,
               });
             }
 
@@ -426,13 +456,19 @@ export async function GET() {
             );
             const createResponse = createResult.response;
 
-            if (createResult.hadDuplicateConflict && duplicateConflictSamples.length < 10) {
+            if (createResult.hadDuplicateConflict) {
+              totalDuplicateConflicts += 1;
+            }
+            if (createResult.hadDuplicateConflict && duplicateConflictSamples.length < 5) {
               duplicateConflictSamples.push({
                 patientId,
-                name: patientName,
-                operation: "POST",
-                status: 409,
-                message: "Retrying create without email due to duplicate/shared email conflict",
+                hubspotId: null,
+                hadPhone: Boolean(phoneNumber),
+                hadEmail: Boolean(email),
+                hadSemblePatientId: false,
+                matchedByNamePhone: false,
+                matchedByNameEmail: false,
+                duplicateConflict: true,
               });
             }
 
@@ -494,6 +530,7 @@ export async function GET() {
       hubSpotContactsChecked: totalHubSpotContactsChecked,
       hubSpotContactsWithSemblePatientId: totalHubSpotContactsWithSemblePatientId,
       hubSpotContactsWithoutSemblePatientId: totalHubSpotContactsWithoutSemblePatientId,
+      duplicateConflicts: totalDuplicateConflicts,
       matchingPathCounts: {
         matchedBySembleId: totalUpdatedBySembleId,
         matchedByNamePhone: totalMatchedByNamePhone,
