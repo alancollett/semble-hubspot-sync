@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/cron/sync-semble-new-patients",
-      "schedule": "*/30 * * * *"
+      "schedule": "0 20 * * *"
     },
     {
       "path": "/api/cron/sync-semble-to-hubspot",
