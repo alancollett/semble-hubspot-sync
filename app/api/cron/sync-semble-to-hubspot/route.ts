@@ -9,6 +9,30 @@ const HUBSPOT_CALL_DELAY_MS = 200;
 const HUBSPOT_RETRY_DELAY_MS = 1500;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function normalizeName(value?: string | null): string {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function normalizePhone(value?: string | null): string {
+  const digitsOnly = String(value ?? "").replace(/\D/g, "");
+  if (!digitsOnly) {
+    return "";
+  }
+  if (digitsOnly.startsWith("440")) {
+    return `0${digitsOnly.slice(3)}`;
+  }
+  if (digitsOnly.startsWith("44")) {
+    return `0${digitsOnly.slice(2)}`;
+  }
+  if (digitsOnly.startsWith("0")) {
+    return digitsOnly;
+  }
+  return digitsOnly;
+}
+
 function sanitizeEmail(email?: string | null): string | undefined {
   if (!email) {
     return undefined;
@@ -44,6 +68,15 @@ export async function GET() {
   let totalHubSpotContactsWithSemblePatientId = 0;
   let totalHubSpotContactsWithoutSemblePatientId = 0;
   let totalDuplicateConflicts = 0;
+  let totalBackfilledMissingSembleId = 0;
+  let totalAmbiguousBackfillMatches = 0;
+  const hubSpotMissingSembleIdContacts: Array<{
+    id: string;
+    normalizedFirstName: string;
+    normalizedLastName: string;
+    normalizedPhone: string;
+    hadEmail: boolean;
+  }> = [];
   const failedPatients: Array<{
     patientId: string;
     name: string;
@@ -91,6 +124,16 @@ export async function GET() {
     matchedByNamePhone: boolean;
     matchedByNameEmail: boolean;
     duplicateConflict: true;
+  }> = [];
+  const ambiguousBackfillSamples: Array<{
+    patientId: string;
+    hubspotId: null;
+    hadPhone: boolean;
+    hadEmail: boolean;
+    hadSemblePatientId: false;
+    matchedByNamePhone: false;
+    matchedByNameEmail: false;
+    duplicateConflict: false;
   }> = [];
 
   try {
@@ -215,6 +258,14 @@ export async function GET() {
                 duplicateConflict: false,
               });
             }
+
+            hubSpotMissingSembleIdContacts.push({
+              id: String(contact?.id ?? ""),
+              normalizedFirstName: normalizeName(contact?.properties?.firstname),
+              normalizedLastName: normalizeName(contact?.properties?.lastname),
+              normalizedPhone: normalizePhone(contact?.properties?.phone),
+              hadEmail: Boolean(contact?.properties?.email),
+            });
           }
         }
 
@@ -327,31 +378,50 @@ export async function GET() {
             },
           ]);
           let matchMethod: "semble_id" | "name_phone" | "name_email" | "new" = "new";
+          let skipCreateForAmbiguousBackfill = false;
+          let usedNormalizedBackfillMatch = false;
 
           if (existingContactId) {
             matchMethod = "semble_id";
           } else {
-            existingContactId = await searchContact([
-              {
-                propertyName: "firstname",
-                operator: "EQ",
-                value: patient.firstName ?? "",
-              },
-              {
-                propertyName: "lastname",
-                operator: "EQ",
-                value: patient.lastName ?? "",
-              },
-              {
-                propertyName: "phone",
-                operator: "EQ",
-                value: phoneNumber,
-              },
-            ]);
+            const normalizedPatientFirstName = normalizeName(patient.firstName);
+            const normalizedPatientLastName = normalizeName(patient.lastName);
+            const normalizedPatientPhone = normalizePhone(phoneNumber);
+            const normalizedMatches = hubSpotMissingSembleIdContacts.filter((contact) => {
+              return (
+                contact.normalizedFirstName === normalizedPatientFirstName &&
+                contact.normalizedLastName === normalizedPatientLastName &&
+                Boolean(normalizedPatientPhone) &&
+                contact.normalizedPhone === normalizedPatientPhone
+              );
+            });
 
-            if (existingContactId) {
+            if (normalizedMatches.length === 1) {
+              existingContactId = normalizedMatches[0].id;
               matchMethod = "name_phone";
-            } else if (email) {
+              usedNormalizedBackfillMatch = true;
+            } else if (normalizedMatches.length > 1) {
+              totalAmbiguousBackfillMatches += 1;
+              skipCreateForAmbiguousBackfill = true;
+              if (ambiguousBackfillSamples.length < 5) {
+                ambiguousBackfillSamples.push({
+                  patientId,
+                  hubspotId: null,
+                  hadPhone: Boolean(phoneNumber),
+                  hadEmail: Boolean(email),
+                  hadSemblePatientId: false,
+                  matchedByNamePhone: false,
+                  matchedByNameEmail: false,
+                  duplicateConflict: false,
+                });
+              }
+            }
+
+            if (skipCreateForAmbiguousBackfill) {
+              continue;
+            }
+
+            if (!existingContactId) {
               existingContactId = await searchContact([
                 {
                   propertyName: "firstname",
@@ -364,14 +434,36 @@ export async function GET() {
                   value: patient.lastName ?? "",
                 },
                 {
-                  propertyName: "email",
+                  propertyName: "phone",
                   operator: "EQ",
-                  value: email,
+                  value: phoneNumber,
                 },
               ]);
 
               if (existingContactId) {
-                matchMethod = "name_email";
+                matchMethod = "name_phone";
+              } else if (email) {
+                existingContactId = await searchContact([
+                  {
+                    propertyName: "firstname",
+                    operator: "EQ",
+                    value: patient.firstName ?? "",
+                  },
+                  {
+                    propertyName: "lastname",
+                    operator: "EQ",
+                    value: patient.lastName ?? "",
+                  },
+                  {
+                    propertyName: "email",
+                    operator: "EQ",
+                    value: email,
+                  },
+                ]);
+
+                if (existingContactId) {
+                  matchMethod = "name_email";
+                }
               }
             }
           }
@@ -419,6 +511,9 @@ export async function GET() {
             } else if (matchMethod === "name_phone") {
               totalMatchedByNamePhone += 1;
               totalBackfilled += 1;
+              if (usedNormalizedBackfillMatch) {
+                totalBackfilledMissingSembleId += 1;
+              }
               if (matchedByNamePhoneSamples.length < 5) {
                 matchedByNamePhoneSamples.push({
                   patientId,
@@ -531,6 +626,8 @@ export async function GET() {
       hubSpotContactsWithSemblePatientId: totalHubSpotContactsWithSemblePatientId,
       hubSpotContactsWithoutSemblePatientId: totalHubSpotContactsWithoutSemblePatientId,
       duplicateConflicts: totalDuplicateConflicts,
+      backfilledMissingSembleId: totalBackfilledMissingSembleId,
+      ambiguousBackfillMatches: totalAmbiguousBackfillMatches,
       matchingPathCounts: {
         matchedBySembleId: totalUpdatedBySembleId,
         matchedByNamePhone: totalMatchedByNamePhone,
@@ -542,14 +639,15 @@ export async function GET() {
       matchedByNamePhoneSamples,
       unmatchedSembleSamples,
       duplicateConflictSamples,
+      ambiguousBackfillSamples,
       matchingBehavior: {
         searchesHubSpotContactsWithoutSemblePatientId: true,
         note: "After semble_patient_id lookup, name+phone and name+email searches are global HubSpot contact searches without requiring semble_patient_id.",
       },
       normalization: {
-        phoneNormalizedBeforeComparison: false,
-        namesNormalizedBeforeComparison: false,
-        note: "Phone, first name, and last name are compared as exact values from Semble and HubSpot; only email is trimmed/lowercased and validated.",
+        phoneNormalizedBeforeComparison: true,
+        namesNormalizedBeforeComparison: true,
+        note: "Name and phone are normalized for backfill matching against HubSpot contacts missing semble_patient_id; other HubSpot search filters remain exact-match.",
       },
     },
     pageSize,
