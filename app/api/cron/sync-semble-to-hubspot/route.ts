@@ -40,6 +40,9 @@ export async function GET() {
   let totalMatchedByNamePhone = 0;
   let totalMatchedByNameEmail = 0;
   let totalFailed = 0;
+  let totalHubSpotContactsChecked = 0;
+  let totalHubSpotContactsWithSemblePatientId = 0;
+  let totalHubSpotContactsWithoutSemblePatientId = 0;
   const failedPatients: Array<{
     patientId: string;
     name: string;
@@ -47,6 +50,33 @@ export async function GET() {
     phone: string;
     status: number | null;
     error: string;
+  }> = [];
+  const missingSembleIdHubSpotSamples: Array<{
+    id: string;
+    firstname: string | null;
+    lastname: string | null;
+    phone: string | null;
+    email: string | null;
+    semble_patient_id: null;
+  }> = [];
+  const matchedByNamePhoneSamples: Array<{
+    patientId: string;
+    name: string;
+    phone: string;
+    matchedHubSpotContactId: string;
+  }> = [];
+  const unmatchedSembleSamples: Array<{
+    patientId: string;
+    name: string;
+    phone: string;
+    email: string | null;
+  }> = [];
+  const duplicateConflictSamples: Array<{
+    patientId: string;
+    name: string;
+    operation: "PATCH" | "POST";
+    status: number;
+    message: string;
   }> = [];
 
   try {
@@ -111,19 +141,76 @@ export async function GET() {
         });
 
       let response = await runRequest(properties);
+      let hadDuplicateConflict = false;
       if (response.ok) {
-        return response;
+        return { response, hadDuplicateConflict };
       }
 
       const hasEmail = Boolean(properties.email);
       if (hasEmail && response.status === 409) {
+        hadDuplicateConflict = true;
         const retryProperties = { ...properties };
         delete retryProperties.email;
         response = await runRequest(retryProperties);
       }
 
-      return response;
+      return { response, hadDuplicateConflict };
     };
+
+    const fetchHubSpotContactDiagnostics = async () => {
+      let after: string | undefined;
+
+      while (true) {
+        const hubSpotContactsResponse = await fetchHubSpot(
+          `https://api.hubapi.com/crm/v3/objects/contacts?limit=100&properties=firstname&properties=lastname&properties=phone&properties=email&properties=semble_patient_id${after ? `&after=${encodeURIComponent(after)}` : ""}`,
+          {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN!}`,
+              "Content-Type": "application/json",
+            },
+          },
+        );
+
+        if (!hubSpotContactsResponse.ok) {
+          const errorBody = await hubSpotContactsResponse.text();
+          throw new Error(
+            errorBody || "Failed to fetch HubSpot contacts for diagnostics",
+          );
+        }
+
+        const hubSpotContactsData = await hubSpotContactsResponse.json();
+        const contacts = hubSpotContactsData?.results ?? [];
+        totalHubSpotContactsChecked += contacts.length;
+
+        for (const contact of contacts) {
+          const semblePatientId = String(contact?.properties?.semble_patient_id ?? "").trim();
+          if (semblePatientId) {
+            totalHubSpotContactsWithSemblePatientId += 1;
+          } else {
+            totalHubSpotContactsWithoutSemblePatientId += 1;
+            if (missingSembleIdHubSpotSamples.length < 10) {
+              missingSembleIdHubSpotSamples.push({
+                id: String(contact?.id ?? ""),
+                firstname: contact?.properties?.firstname ?? null,
+                lastname: contact?.properties?.lastname ?? null,
+                phone: contact?.properties?.phone ?? null,
+                email: contact?.properties?.email ?? null,
+                semble_patient_id: null,
+              });
+            }
+          }
+        }
+
+        const nextAfter = hubSpotContactsData?.paging?.next?.after as string | undefined;
+        if (!nextAfter) {
+          break;
+        }
+        after = nextAfter;
+      }
+    };
+
+    await fetchHubSpotContactDiagnostics();
 
     while (true) {
       const sembleResponse = await fetch(process.env.SEMBLE_API_URL!, {
@@ -274,11 +361,22 @@ export async function GET() {
           }
 
           if (existingContactId) {
-            const updateResponse = await upsertWithEmailRetry(
+            const updateResult = await upsertWithEmailRetry(
               "PATCH",
               `https://api.hubapi.com/crm/v3/objects/contacts/${existingContactId}`,
               properties,
             );
+            const updateResponse = updateResult.response;
+
+            if (updateResult.hadDuplicateConflict && duplicateConflictSamples.length < 10) {
+              duplicateConflictSamples.push({
+                patientId,
+                name: patientName,
+                operation: "PATCH",
+                status: 409,
+                message: "Retrying update without email due to duplicate/shared email conflict",
+              });
+            }
 
             if (!updateResponse.ok) {
               const errorBody = await updateResponse.text();
@@ -299,16 +397,44 @@ export async function GET() {
             } else if (matchMethod === "name_phone") {
               totalMatchedByNamePhone += 1;
               totalBackfilled += 1;
+              if (matchedByNamePhoneSamples.length < 10) {
+                matchedByNamePhoneSamples.push({
+                  patientId,
+                  name: patientName,
+                  phone: phoneNumber,
+                  matchedHubSpotContactId: existingContactId,
+                });
+              }
             } else if (matchMethod === "name_email") {
               totalMatchedByNameEmail += 1;
               totalBackfilled += 1;
             }
           } else {
-            const createResponse = await upsertWithEmailRetry(
+            if (unmatchedSembleSamples.length < 10) {
+              unmatchedSembleSamples.push({
+                patientId,
+                name: patientName,
+                phone: phoneNumber,
+                email: email ?? null,
+              });
+            }
+
+            const createResult = await upsertWithEmailRetry(
               "POST",
               "https://api.hubapi.com/crm/v3/objects/contacts",
               properties,
             );
+            const createResponse = createResult.response;
+
+            if (createResult.hadDuplicateConflict && duplicateConflictSamples.length < 10) {
+              duplicateConflictSamples.push({
+                patientId,
+                name: patientName,
+                operation: "POST",
+                status: 409,
+                message: "Retrying create without email due to duplicate/shared email conflict",
+              });
+            }
 
             if (!createResponse.ok) {
               const errorBody = await createResponse.text();
@@ -364,6 +490,31 @@ export async function GET() {
     created: totalCreated,
     failed: totalFailed,
     failedPatients,
+    diagnostics: {
+      hubSpotContactsChecked: totalHubSpotContactsChecked,
+      hubSpotContactsWithSemblePatientId: totalHubSpotContactsWithSemblePatientId,
+      hubSpotContactsWithoutSemblePatientId: totalHubSpotContactsWithoutSemblePatientId,
+      matchingPathCounts: {
+        matchedBySembleId: totalUpdatedBySembleId,
+        matchedByNamePhone: totalMatchedByNamePhone,
+        matchedByNameEmail: totalMatchedByNameEmail,
+        noMatchCreated: totalCreated,
+        skippedNoPhone: totalSkippedNoPhone,
+      },
+      missingSembleIdHubSpotSamples,
+      matchedByNamePhoneSamples,
+      unmatchedSembleSamples,
+      duplicateConflictSamples,
+      matchingBehavior: {
+        searchesHubSpotContactsWithoutSemblePatientId: true,
+        note: "After semble_patient_id lookup, name+phone and name+email searches are global HubSpot contact searches without requiring semble_patient_id.",
+      },
+      normalization: {
+        phoneNormalizedBeforeComparison: false,
+        namesNormalizedBeforeComparison: false,
+        note: "Phone, first name, and last name are compared as exact values from Semble and HubSpot; only email is trimmed/lowercased and validated.",
+      },
+    },
     pageSize,
     pagesProcessed: page - 1,
   });
